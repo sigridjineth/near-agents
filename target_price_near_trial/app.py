@@ -32,22 +32,28 @@ You can set a target price in USD with a direction ('above' or 'below'),
 and notify the user when the current NEAR price meets that condition.
 If the user hasn't set a target yet, request one.
 """
-MODEL_NAME = "llama-v3p1-405b-instruct" # Placeholder if using real LLM
+MODEL_NAME = "llama-v3p1-405b-instruct"  # Placeholder if using real LLM
+
 
 # --- Pydantic Models for Request/Response ---
 class UserInput(BaseModel):
+    model: str = Field(..., description="llm model.")
     user_message: str = Field(..., description="The message from the user.")
     # You could add history here if needed for more complex conversations
     # history: Optional[List[Dict[str, str]]] = None
+
 
 class AssistantResponse(BaseModel):
     assistant_message: str = Field(..., description="The response from the assistant.")
     # You could return updated history here
     # updated_history: Optional[List[Dict[str, str]]] = None
-    target_info: Optional[Dict[str, Any]] = Field(None, description="Current target price info, if any.")
+    target_info: Optional[Dict[str, Any]] = Field(
+        None, description="Current target price info, if any."
+    )
 
 
 # --- Utility Functions (Adapted for FastAPI context) ---
+
 
 def load_target_info() -> Optional[dict]:
     """
@@ -58,7 +64,7 @@ def load_target_info() -> Optional[dict]:
         logger.warning(f"{TARGET_FILE} not found.")
         return None
     try:
-        with open(TARGET_FILE, 'r') as f:
+        with open(TARGET_FILE, "r") as f:
             content = f.read().strip()
             if not content:
                 logger.info(f"{TARGET_FILE} is empty.")
@@ -74,6 +80,7 @@ def load_target_info() -> Optional[dict]:
         logger.error(f"Unexpected error reading {TARGET_FILE}: {e}")
         return None
 
+
 def save_target_info(data: Optional[dict]) -> None:
     """
     Saves target price info to TARGET_FILE.
@@ -83,9 +90,11 @@ def save_target_info(data: Optional[dict]) -> None:
         content = ""
         if data is not None:
             content = json.dumps(data)
-        with open(TARGET_FILE, 'w') as f:
+        with open(TARGET_FILE, "w") as f:
             f.write(content)
-        logger.info(f"Saved target info to {TARGET_FILE}: {content if content else 'cleared'}")
+        logger.info(
+            f"Saved target info to {TARGET_FILE}: {content if content else 'cleared'}"
+        )
     except Exception as e:
         logger.error(f"Failed to write {TARGET_FILE}: {e}")
         # Decide how to handle write errors - raise exception? Log and continue?
@@ -103,7 +112,7 @@ def get_near_price() -> Optional[float]:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=near&vs_currencies=usd"
         # In production, remove verify=False or configure certs properly
         response = requests.get(url, timeout=10, verify=False)
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
         if "near" in data and "usd" in data["near"]:
@@ -122,8 +131,14 @@ def get_near_price() -> Optional[float]:
         error_message = f"[ERROR] RequestException from CoinGecko: {e}"
         logger.error(error_message)
         return None
-    except (json.JSONDecodeError, KeyError, ValueError) as e: # Added ValueError for float conversion
-        error_message = f"[ERROR] Parsing CoinGecko response failed or invalid data: {e}"
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        ValueError,
+    ) as e:  # Added ValueError for float conversion
+        error_message = (
+            f"[ERROR] Parsing CoinGecko response failed or invalid data: {e}"
+        )
         logger.error(error_message)
         return None
     # Ensure error_message is captured if needed outside, though returning None is the signal
@@ -136,7 +151,9 @@ def parse_target_message(message: str) -> dict:
     """
     parts = message.strip().split()
     if len(parts) != 2:
-        raise ValueError("Message must be in 'PRICE DIRECTION' format (e.g., '3.5 above' or '$4 below').")
+        raise ValueError(
+            "Message must be in 'PRICE DIRECTION' format (e.g., '3.5 above' or '$4 below')."
+        )
 
     target_str, direction_str = parts
     direction_str = direction_str.lower()
@@ -144,7 +161,7 @@ def parse_target_message(message: str) -> dict:
         raise ValueError("Direction must be 'above' or 'below'.")
 
     if target_str.startswith("$"):
-        target_str = target_str[1:] # Remove leading '$'
+        target_str = target_str[1:]  # Remove leading '$'
 
     try:
         target_val = float(target_str)
@@ -156,6 +173,7 @@ def parse_target_message(message: str) -> dict:
 
     return {"target": target_val, "direction": direction_str}
 
+
 # --- FastAPI App ---
 app = FastAPI(
     title="NEAR Price Alert Assistant",
@@ -163,6 +181,7 @@ app = FastAPI(
 )
 
 # --- Main Logic Function (Adapted for FastAPI) ---
+
 
 def handle_near_price_alert_logic(user_message_content: str) -> str:
     """
@@ -172,7 +191,7 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
     """
     target_info = load_target_info()
     assistant_explanation = ""
-    api_error_message = None # To capture errors from API calls like get_near_price
+    api_error_message = None  # To capture errors from API calls like get_near_price
 
     # 1) Handle based on whether a target is already set
     if not target_info:
@@ -186,7 +205,7 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
                 f"{parsed['direction']} ${parsed['target']:.2f}."
             )
             logger.info(f"New target set: {parsed}")
-            target_info = parsed # Update target_info for response model
+            target_info = parsed  # Update target_info for response model
         except ValueError as e:
             # User input was not a valid target setting command.
             # Assume it's a general query or greeting when no target is set.
@@ -196,7 +215,7 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
                 "My apologies for the Korean response earlier! Let me try that again.\n\n"
                 "You haven't set a target price alert for NEAR yet. Would you like to set one? "
                 "Please respond with a target price in USD and a direction ('above' or 'below'), "
-                "e.g. \"$3.00 above\" or \"$2.00 below\"."
+                'e.g. "$3.00 above" or "$2.00 below".'
             )
             # In a real LLM integration, you would call the LLM here with history + system prompt.
             # For example:
@@ -221,12 +240,14 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
                 f"{parsed['direction']} ${parsed['target']:.2f}."
             )
             logger.info(f"Target updated: {parsed}")
-            target_info = parsed # Update target_info for response model
+            target_info = parsed  # Update target_info for response model
             # return assistant_explanation # Exit early after updating
 
         except ValueError:
-             # Input wasn't a new target command, proceed to check price against existing target
-            logger.info(f"User input '{user_message_content}' not a target command, checking price against existing target: {target_info}")
+            # Input wasn't a new target command, proceed to check price against existing target
+            logger.info(
+                f"User input '{user_message_content}' not a target command, checking price against existing target: {target_info}"
+            )
             current_price = get_near_price()
 
             if current_price is None:
@@ -252,9 +273,11 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
                         f"🚨 **ALERT!** NEAR price is now **${current_price:.4f}**, which is {direction} your target of ${t_val:.2f}!\n\n"
                         "Target has been cleared. To set a new one, just tell me the price and direction (e.g., '5.0 above')."
                     )
-                    logger.info(f"Target hit! Price ${current_price:.4f} {direction} ${t_val:.2f}. Clearing target.")
-                    save_target_info(None) # Clear the target
-                    target_info = None # Update target_info for response model
+                    logger.info(
+                        f"Target hit! Price ${current_price:.4f} {direction} ${t_val:.2f}. Clearing target."
+                    )
+                    save_target_info(None)  # Clear the target
+                    target_info = None  # Update target_info for response model
                 else:
                     # Condition not met. Inform user.
                     assistant_explanation = (
@@ -262,19 +285,24 @@ def handle_near_price_alert_logic(user_message_content: str) -> str:
                         f"Your target (${t_val:.2f} {direction}) hasn't been met yet. "
                         f"I'll keep watching!"
                     )
-                    logger.info(f"Target not met. Price ${current_price:.4f}, Target ${t_val:.2f} {direction}.")
+                    logger.info(
+                        f"Target not met. Price ${current_price:.4f}, Target ${t_val:.2f} {direction}."
+                    )
 
         except Exception as e:
             # Handle unexpected errors during price check/logic
-            logger.error(f"Unexpected error checking price or updating target: {e}", exc_info=True)
+            logger.error(
+                f"Unexpected error checking price or updating target: {e}",
+                exc_info=True,
+            )
             assistant_explanation = f"[ERROR] Sorry, an internal error occurred: {e}"
 
-
     # This function now directly returns the string content for the assistant's message
-    return assistant_explanation, target_info # Return message and current target state
+    return assistant_explanation, target_info  # Return message and current target state
 
 
 # --- FastAPI Endpoint ---
+
 
 @app.post("/chat", response_model=AssistantResponse)
 async def chat_endpoint(user_input: UserInput):
@@ -288,13 +316,14 @@ async def chat_endpoint(user_input: UserInput):
 
     try:
         # Call the core logic function
-        assistant_msg_content, current_target_info = handle_near_price_alert_logic(user_input.user_message)
+        assistant_msg_content, current_target_info = handle_near_price_alert_logic(
+            user_input.user_message
+        )
 
         # Construct the response
         response = AssistantResponse(
-            assistant_message=assistant_msg_content,
-            target_info=current_target_info
-            )
+            assistant_message=assistant_msg_content, target_info=current_target_info
+        )
         return response
 
     except HTTPException as http_exc:
@@ -303,14 +332,17 @@ async def chat_endpoint(user_input: UserInput):
     except Exception as e:
         # Catch-all for other unexpected errors during processing
         logger.error(f"Unhandled exception in /chat endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"An internal server error occurred: {e}"
+        )
 
 
 # --- Root endpoint for basic check ---
 @app.get("/")
 async def root():
-    return {"message": "NEAR Price Alert Assistant API is running. Use the /chat endpoint (POST) to interact."}
-
+    return {
+        "message": "NEAR Price Alert Assistant API is running. Use the /chat endpoint (POST) to interact."
+    }
 
 
 if __name__ == "__main__":
