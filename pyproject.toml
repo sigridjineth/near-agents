@@ -1,0 +1,11 @@
+[project]
+name = "pythonproject2"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "certifi>=2025.1.31",
+    "nearai>=0.1.16",
+    "nearai-langchain>=0.0.12",
+    "pip-system-certs>=4.0",
+]
