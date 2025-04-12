@@ -1,14 +1,17 @@
 import json
-import requests
 import logging
+import requests
 
+import uvicorn
+from fastapi import FastAPI, Request
 from nearai_langchain.orchestrator import NearAILangchainOrchestrator, RunMode
 
-# --- 0. 오케스트레이터 초기화 ---
+# -------------------------------------------------
+# 0. 오케스트레이터 초기화
+# -------------------------------------------------
 orchestrator = NearAILangchainOrchestrator(globals())
 env = orchestrator.env
 
-# run_mode가 LOCAL이면, 로컬 로그 설정
 if orchestrator.run_mode == RunMode.LOCAL:
     logging.basicConfig(
         level=logging.INFO,
@@ -18,7 +21,9 @@ if orchestrator.run_mode == RunMode.LOCAL:
 logger = logging.getLogger(__name__)
 
 
+# -------------------------------------------------
 # 로그 메시지 통일 함수
+# -------------------------------------------------
 def log_message(message, level=logging.INFO):
     """
     run_mode에 따라 로컬 또는 env 로그로 기록하는 함수
@@ -29,7 +34,9 @@ def log_message(message, level=logging.INFO):
         env.add_agent_log(message, level)
 
 
-# --- 1. 시스템 메시지 및 상수 정의 ---
+# -------------------------------------------------
+# 1. 시스템 메시지 및 상수 정의
+# -------------------------------------------------
 SYSTEM_PROMPT = """
 You are a NEAR price alert assistant.
 You can set a target price in USD with a direction ('above' or 'below'), 
@@ -41,9 +48,9 @@ MODEL_NAME = "llama-v3p1-405b-instruct"
 TARGET_FILE = "target_price.json"
 
 
-# --- 2. 유틸 함수 ---
-
-
+# -------------------------------------------------
+# 2. 유틸 함수
+# -------------------------------------------------
 def load_target_info() -> dict:
     """
     target_price.json 파일에서 목표 가격 정보를 불러옵니다.
@@ -162,9 +169,9 @@ def generate_llm_response(user_messages, assistant_content: str) -> str:
     return env.completion(MODEL_NAME, all_messages)
 
 
-# --- 3. 메인 로직 ---
-
-
+# -------------------------------------------------
+# 3. 메인 로직
+# -------------------------------------------------
 def handle_near_price_alert():
     """
     - 최근 사용자 메시지를 확인
@@ -175,8 +182,10 @@ def handle_near_price_alert():
     """
     messages = env.list_messages()
     if not messages or messages[-1]["role"] != "user":
-        # 사용자 메시지가 없는 경우, 혹은 마지막 메시지가 사용자가 아니면 입력 요청
-        log_message("No user message found, requesting user input...", logging.WARNING)
+        # 사용자 메시지가 없거나 마지막이 user가 아닌 경우 -> 입력 요청
+        log_message(
+            "No valid user message found, requesting user input...", logging.WARNING
+        )
         env.request_user_input()
         return
 
@@ -251,23 +260,35 @@ def handle_near_price_alert():
     env.request_user_input()
 
 
-# --- 4. 실행부 (예: LOCAL 모드에서 실행 시) ---
-# --- 4. 실행부 (LOCAL 모드에서 인터랙티브 실행 예시) ---
+# -------------------------------------------------
+# FastAPI 애플리케이션 생성
+# -------------------------------------------------
+app = FastAPI()
+
+
+@app.post("/near-price-alert")
+async def near_price_alert(request: Request):
+    """
+    사용자가 {"message": "..."} 형태의 JSON 데이터를 POST하면,
+    이를 user 메시지로 env에 추가한 뒤 handle_near_price_alert를 실행합니다.
+    마지막에 생성된 assistant 메시지를 JSON으로 반환합니다.
+    """
+    data = await request.json()
+    user_message = data.get("message", "").strip()
+
+    # 사용자 메시지를 env에 기록
+    env.add_message("user", user_message)
+
+    # 메인 로직 실행
+    handle_near_price_alert()
+
+    # 로직 실행 후, env에 가장 최근에 추가된 assistant 메시지를 찾아 응답
+    assistant_msg = env.get_last_message(role="assistant")
+    if not assistant_msg:
+        return {"assistant": "No assistant response found."}
+    return {"assistant": assistant_msg["content"]}
+
+
 if __name__ == "__main__":
-    log_message("Starting NEAR price alert handler...", logging.INFO)
-
-    if orchestrator.run_mode == RunMode.LOCAL:
-        # 예시로 무한 루프 형태로 계속 사용자 입력을 받고 처리
-        while True:
-            handle_near_price_alert()
-
-            # 사용자의 즉각적인 반응을 보기 위해 잠시 대기하거나,
-            # 어떤 조건에서 break로 빠져나갈 수 있도록 구성 가능
-            # 예: 사용자가 'exit' 라고 입력하면 종료:
-            last_msg = env.get_last_message(role="user")
-            if last_msg and last_msg.strip().lower() == "exit":
-                log_message("User requested exit. Stopping loop.", logging.INFO)
-                break
-    else:
-        # 로컬 모드가 아닌 경우 한 번만 실행
-        handle_near_price_alert()
+    # 로컬에서 uvicorn으로 서버 실행
+    uvicorn.run(app, host="0.0.0.0", port=8000)

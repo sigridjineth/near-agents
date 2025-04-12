@@ -11,10 +11,7 @@ auth = nearai.CONFIG.get_client_config().auth
 # signature = json.dumps(auth)
 
 # 3) openai 패키지의 클라이언트 생성
-client = openai.OpenAI(
-    base_url=hub_url,
-    api_key=auth
-)
+client = openai.OpenAI(base_url=hub_url, api_key=auth)
 
 # 4) 모델 목록 불러오기
 models = client.models.list()
