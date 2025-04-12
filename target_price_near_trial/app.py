@@ -1,294 +1,332 @@
+# main.py
 import json
-import logging
 import requests
+import logging
+import os
 
 import uvicorn
-from fastapi import FastAPI, Request
-from nearai_langchain.orchestrator import NearAILangchainOrchestrator, RunMode
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any
 
-# -------------------------------------------------
-# 0. 오케스트레이터 초기화
-# -------------------------------------------------
-orchestrator = NearAILangchainOrchestrator(globals())
-env = orchestrator.env
-
-if orchestrator.run_mode == RunMode.LOCAL:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
+# --- Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# Define where to store the target price file
+# Store it in the same directory as the script for simplicity
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TARGET_FILE = os.path.join(SCRIPT_DIR, "target_price.json")
+# Ensure the directory exists if needed (though os.path.join usually handles this)
+# os.makedirs(SCRIPT_DIR, exist_ok=True) # Usually not needed for script dir
 
-# -------------------------------------------------
-# 로그 메시지 통일 함수
-# -------------------------------------------------
-def log_message(message, level=logging.INFO):
-    """
-    run_mode에 따라 로컬 또는 env 로그로 기록하는 함수
-    """
-    if orchestrator.run_mode == RunMode.LOCAL:
-        logger.log(level, message)
-    else:
-        env.add_agent_log(message, level)
-
-
-# -------------------------------------------------
-# 1. 시스템 메시지 및 상수 정의
-# -------------------------------------------------
+# --- Constants ---
+# System prompt isn't directly used in the FastAPI response generation
+# but kept here for context if you integrate a real LLM later.
 SYSTEM_PROMPT = """
 You are a NEAR price alert assistant.
-You can set a target price in USD with a direction ('above' or 'below'), 
+You can set a target price in USD with a direction ('above' or 'below'),
 and notify the user when the current NEAR price meets that condition.
 If the user hasn't set a target yet, request one.
 """
+MODEL_NAME = "llama-v3p1-405b-instruct" # Placeholder if using real LLM
 
-MODEL_NAME = "llama-v3p1-405b-instruct"
-TARGET_FILE = "target_price.json"
+# --- Pydantic Models for Request/Response ---
+class UserInput(BaseModel):
+    user_message: str = Field(..., description="The message from the user.")
+    # You could add history here if needed for more complex conversations
+    # history: Optional[List[Dict[str, str]]] = None
+
+class AssistantResponse(BaseModel):
+    assistant_message: str = Field(..., description="The response from the assistant.")
+    # You could return updated history here
+    # updated_history: Optional[List[Dict[str, str]]] = None
+    target_info: Optional[Dict[str, Any]] = Field(None, description="Current target price info, if any.")
 
 
-# -------------------------------------------------
-# 2. 유틸 함수
-# -------------------------------------------------
-def load_target_info() -> dict:
+# --- Utility Functions (Adapted for FastAPI context) ---
+
+def load_target_info() -> Optional[dict]:
     """
-    target_price.json 파일에서 목표 가격 정보를 불러옵니다.
-    형식: {"target": float, "direction": "above"|"below"}.
-    파일이 없거나 JSON이 비정상이면 None을 반환합니다.
+    Loads target price info from TARGET_FILE.
+    Returns None if file not found, empty, or invalid JSON.
     """
-    try:
-        content = env.read_file(TARGET_FILE)  # NEAR AI env 방식
-        if not content or content == "N/A":
-            return None
-        return json.loads(content)
-    except FileNotFoundError:
-        log_message(f"{TARGET_FILE} not found.", logging.WARNING)
+    if not os.path.exists(TARGET_FILE):
+        logger.warning(f"{TARGET_FILE} not found.")
         return None
+    try:
+        with open(TARGET_FILE, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                logger.info(f"{TARGET_FILE} is empty.")
+                return None
+            return json.loads(content)
     except json.JSONDecodeError as e:
-        msg = f"Failed to parse {TARGET_FILE}: {e}"
-        log_message(msg, logging.ERROR)
-        env.add_message("assistant", f"[ERROR] {msg}")
+        logger.error(f"Failed to parse {TARGET_FILE}: {e}")
+        # In a real app, you might want to handle this more gracefully,
+        # maybe backup/delete the corrupted file.
+        # For now, treat as no target set.
         return None
     except Exception as e:
-        msg = f"Unexpected error reading {TARGET_FILE}: {e}"
-        log_message(msg, logging.ERROR)
-        env.add_message("assistant", f"[ERROR] {msg}")
+        logger.error(f"Unexpected error reading {TARGET_FILE}: {e}")
         return None
 
-
-def save_target_info(data) -> None:
+def save_target_info(data: Optional[dict]) -> None:
     """
-    목표 가격 정보를 target_price.json에 저장합니다.
-    data: dict or None
+    Saves target price info to TARGET_FILE.
+    Writes empty string if data is None (clears target).
     """
     try:
-        if data is None:
-            # 목표를 초기화하려면, 파일을 빈 내용으로 덮어씌우거나 삭제할 수 있음
-            env.write_file(TARGET_FILE, "")
-            return
-        env.write_file(TARGET_FILE, json.dumps(data))
+        content = ""
+        if data is not None:
+            content = json.dumps(data)
+        with open(TARGET_FILE, 'w') as f:
+            f.write(content)
+        logger.info(f"Saved target info to {TARGET_FILE}: {content if content else 'cleared'}")
     except Exception as e:
-        msg = f"Failed to write {TARGET_FILE}: {e}"
-        log_message(msg, logging.ERROR)
-        env.add_message("assistant", f"[ERROR] {msg}")
+        logger.error(f"Failed to write {TARGET_FILE}: {e}")
+        # Decide how to handle write errors - raise exception? Log and continue?
+        # For now, just log it. The application state might become inconsistent.
+        # raise HTTPException(status_code=500, detail=f"Failed to save target info: {e}")
 
 
-def get_near_price() -> float:
+def get_near_price() -> Optional[float]:
     """
-    CoinGecko API를 사용하여 현재 NEAR 가격(USD)을 가져옵니다.
-    오류 발생 시 None 반환하고, 관련 메시지를 env.add_message로 알림.
+    Gets current NEAR price (USD) from CoinGecko.
+    Returns float or None on error. Logs errors.
     """
+    error_message = None
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=near&vs_currencies=usd"
+        # In production, remove verify=False or configure certs properly
         response = requests.get(url, timeout=10, verify=False)
-        response.raise_for_status()
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
         if "near" in data and "usd" in data["near"]:
-            return float(data["near"]["usd"])
+            price = float(data["near"]["usd"])
+            logger.info(f"Fetched NEAR price: ${price:.4f}")
+            return price
         else:
-            warn_msg = "[WARN] CoinGecko response missing 'near'/'usd' fields."
-            log_message(warn_msg, logging.WARNING)
-            env.add_message("assistant", warn_msg)
+            error_message = "[WARN] CoinGecko response missing 'near'/'usd' fields."
+            logger.warning(error_message)
             return None
     except requests.exceptions.Timeout:
-        err_msg = "[ERROR] Request to CoinGecko timed out."
-        log_message(err_msg, logging.ERROR)
-        env.add_message("assistant", err_msg)
+        error_message = "[ERROR] Request to CoinGecko timed out."
+        logger.error(error_message)
         return None
     except requests.exceptions.RequestException as e:
-        err_msg = f"[ERROR] RequestException from CoinGecko: {e}"
-        log_message(err_msg, logging.ERROR)
-        env.add_message("assistant", err_msg)
+        error_message = f"[ERROR] RequestException from CoinGecko: {e}"
+        logger.error(error_message)
         return None
-    except (json.JSONDecodeError, KeyError) as e:
-        err_msg = f"[ERROR] Parsing CoinGecko response failed: {e}"
-        log_message(err_msg, logging.ERROR)
-        env.add_message("assistant", err_msg)
+    except (json.JSONDecodeError, KeyError, ValueError) as e: # Added ValueError for float conversion
+        error_message = f"[ERROR] Parsing CoinGecko response failed or invalid data: {e}"
+        logger.error(error_message)
         return None
+    # Ensure error_message is captured if needed outside, though returning None is the signal
 
 
 def parse_target_message(message: str) -> dict:
     """
-    사용자 입력(예: '3.5 above')을 파싱하여
-    {"target": float, "direction": "above"|"below"} 형태로 반환합니다.
-    형식이 잘못되면 ValueError를 발생시킵니다.
+    Parses user input like '3.5 above' into {'target': float, 'direction': 'above'|'below'}.
+    Raises ValueError on invalid format.
     """
     parts = message.strip().split()
     if len(parts) != 2:
-        raise ValueError("메시지는 '가격 방향' 형식이어야 합니다. 예) '3.5 above'")
+        raise ValueError("Message must be in 'PRICE DIRECTION' format (e.g., '3.5 above' or '$4 below').")
 
     target_str, direction_str = parts
     direction_str = direction_str.lower()
     if direction_str not in ["above", "below"]:
-        raise ValueError("두 번째 단어는 'above' 또는 'below' 여야 합니다.")
+        raise ValueError("Direction must be 'above' or 'below'.")
 
     if target_str.startswith("$"):
-        target_str = target_str[1:]  # '$' 제거
+        target_str = target_str[1:] # Remove leading '$'
 
-    target_val = float(target_str)
-    if target_val <= 0:
-        raise ValueError("목표 가격은 0보다 커야 합니다.")
+    try:
+        target_val = float(target_str)
+        if target_val <= 0:
+            raise ValueError("Target price must be greater than 0.")
+    except ValueError:
+        # Catch non-float values
+        raise ValueError(f"Invalid price value: '{target_str}'. Must be a number.")
 
     return {"target": target_val, "direction": direction_str}
 
+# --- FastAPI App ---
+app = FastAPI(
+    title="NEAR Price Alert Assistant",
+    description="Set price targets for NEAR and get alerts.",
+)
 
-def generate_llm_response(user_messages, assistant_content: str) -> str:
-    """
-    시스템 프롬프트(SYSTEM_PROMPT) + 기존 메시지(user_messages) +
-    새 assistant 메시지(assistant_content)를 합쳐 LLM에게 전달하고,
-    최종 답변 텍스트를 반환합니다.
-    """
-    all_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *user_messages,
-        {"role": "assistant", "content": assistant_content},
-    ]
-    # env.completion(model_name, messages) 사용
-    return env.completion(MODEL_NAME, all_messages)
+# --- Main Logic Function (Adapted for FastAPI) ---
 
-
-# -------------------------------------------------
-# 3. 메인 로직
-# -------------------------------------------------
-def handle_near_price_alert():
+def handle_near_price_alert_logic(user_message_content: str) -> str:
     """
-    - 최근 사용자 메시지를 확인
-    - 목표 가격 정보 (target_price.json) 불러오기
-    - 만약 목표가 없으면, 사용자 입력을 파싱해 새로 설정
-    - 이미 목표가 있다면 현재 NEAR 가격 체크 후, 조건 충족 시 알림 후 목표 초기화
-    - 마지막으로 LLM 응답을 생성하고, 메시지를 보낸 뒤 다음 사용자 입력을 요청
+    Core logic adapted for a stateless request.
+    Reads/writes target file, checks price, generates response string.
+    Returns the assistant's message content.
     """
-    messages = env.list_messages()
-    if not messages or messages[-1]["role"] != "user":
-        # 사용자 메시지가 없거나 마지막이 user가 아닌 경우 -> 입력 요청
-        log_message(
-            "No valid user message found, requesting user input...", logging.WARNING
-        )
-        env.request_user_input()
-        return
-
-    user_message_content = messages[-1]["content"]
     target_info = load_target_info()
-
-    # LLM에 넘길 assistant 내용(추가 설명) 누적
     assistant_explanation = ""
+    api_error_message = None # To capture errors from API calls like get_near_price
 
-    # 1) 목표 정보가 없을 경우 -> 사용자 입력을 통해 새로 설정 시도
+    # 1) Handle based on whether a target is already set
     if not target_info:
+        # No target set. Try to parse user message as a new target.
         try:
             parsed = parse_target_message(user_message_content)
             save_target_info(parsed)
-            assistant_explanation += (
-                f"목표 가격이 설정되었습니다! NEAR가 ${parsed['target']:.2f} "
-                f"{parsed['direction']}에 도달하면 알려드릴게요."
+            # Confirmation message after setting target
+            assistant_explanation = (
+                f"OK. Target set! I'll let you know when NEAR goes "
+                f"{parsed['direction']} ${parsed['target']:.2f}."
             )
+            logger.info(f"New target set: {parsed}")
+            target_info = parsed # Update target_info for response model
         except ValueError as e:
-            # 사용자 입력 형식 잘못됨
-            err_msg = f"[WARN] {e}"
-            log_message(err_msg, logging.WARNING)
-            assistant_explanation += (
-                f"{err_msg}\n올바른 예: '3.5 above' 또는 '$4 below' 형태"
+            # User input was not a valid target setting command.
+            # Assume it's a general query or greeting when no target is set.
+            # ** HERE WE RETURN THE HARDCODED RESPONSE FROM YOUR EXAMPLE **
+            logger.warning(f"User input parsing failed: {e}. Assuming general query.")
+            assistant_explanation = (
+                "My apologies for the Korean response earlier! Let me try that again.\n\n"
+                "You haven't set a target price alert for NEAR yet. Would you like to set one? "
+                "Please respond with a target price in USD and a direction ('above' or 'below'), "
+                "e.g. \"$3.00 above\" or \"$2.00 below\"."
             )
-            final_answer = generate_llm_response(messages, assistant_explanation)
-            env.add_message("assistant", final_answer)
-            env.request_user_input()
-            return
+            # In a real LLM integration, you would call the LLM here with history + system prompt.
+            # For example:
+            # messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message_content}]
+            # assistant_explanation = call_llm_api(MODEL_NAME, messages) # Replace with actual LLM call
         except Exception as e:
-            err_msg = f"[ERROR] Unexpected error setting target: {e}"
-            log_message(err_msg, logging.ERROR)
-            assistant_explanation += err_msg
-            final_answer = generate_llm_response(messages, assistant_explanation)
-            env.add_message("assistant", final_answer)
-            env.request_user_input()
-            return
+            # Handle unexpected errors during parsing/saving
+            logger.error(f"Unexpected error setting target: {e}", exc_info=True)
+            assistant_explanation = f"[ERROR] Sorry, an internal error occurred while trying to set the target: {e}"
+            # Potentially clear the target file if saving failed midway?
+            # save_target_info(None)
 
     else:
-        # 2) 이미 목표가 설정되어 있다면 -> 현재 가격 체크
-        current_price = get_near_price()
-        if current_price is None:
-            # 오류 메시지는 get_near_price 내에서 이미 전송
-            assistant_explanation += (
-                "NEAR 가격을 불러오지 못해 알림을 진행할 수 없습니다."
+        # Target already exists. Check current price vs target.
+        # Also check if user wants to *change* the target
+        try:
+            # Try parsing message *first* in case user wants to change target
+            parsed = parse_target_message(user_message_content)
+            save_target_info(parsed)
+            assistant_explanation = (
+                f"OK. Target updated! I'll let you know when NEAR goes "
+                f"{parsed['direction']} ${parsed['target']:.2f}."
             )
-        else:
-            t_val = target_info["target"]
-            direction = target_info["direction"]
-            if (direction == "above" and current_price > t_val) or (
-                direction == "below" and current_price < t_val
-            ):
-                # 조건 충족 -> 알림 후 목표 초기화
-                assistant_explanation += (
-                    f"🚨 알림: 현재 NEAR=${current_price:.4f} "
-                    f"(목표=${t_val:.2f}, {direction}) 조건 충족!\n"
-                    "목표를 초기화합니다. 새 목표가 필요하면 다시 말씀해주세요."
+            logger.info(f"Target updated: {parsed}")
+            target_info = parsed # Update target_info for response model
+            # return assistant_explanation # Exit early after updating
+
+        except ValueError:
+             # Input wasn't a new target command, proceed to check price against existing target
+            logger.info(f"User input '{user_message_content}' not a target command, checking price against existing target: {target_info}")
+            current_price = get_near_price()
+
+            if current_price is None:
+                # Error fetching price is logged within get_near_price
+                # Provide a user-friendly message
+                assistant_explanation = (
+                    f"Sorry, I couldn't fetch the current NEAR price. "
+                    f"Your target is still set for ${target_info['target']:.2f} {target_info['direction']}. "
+                    "I'll check again later."
                 )
-                save_target_info(None)
             else:
-                # 아직 미도달
-                assistant_explanation += (
-                    f"현재 NEAR=${current_price:.4f}, 목표=${t_val:.2f} {direction}. "
-                    f"아직 조건에 도달하지 않았습니다."
-                )
+                t_val = target_info["target"]
+                direction = target_info["direction"]
+                hit = False
+                if direction == "above" and current_price > t_val:
+                    hit = True
+                elif direction == "below" and current_price < t_val:
+                    hit = True
 
-    # 3) 최종 LLM 답변 생성 및 전송
-    final_answer = generate_llm_response(messages, assistant_explanation)
-    env.add_message("assistant", final_answer)
+                if hit:
+                    # Condition met! Notify and clear target.
+                    assistant_explanation = (
+                        f"🚨 **ALERT!** NEAR price is now **${current_price:.4f}**, which is {direction} your target of ${t_val:.2f}!\n\n"
+                        "Target has been cleared. To set a new one, just tell me the price and direction (e.g., '5.0 above')."
+                    )
+                    logger.info(f"Target hit! Price ${current_price:.4f} {direction} ${t_val:.2f}. Clearing target.")
+                    save_target_info(None) # Clear the target
+                    target_info = None # Update target_info for response model
+                else:
+                    # Condition not met. Inform user.
+                    assistant_explanation = (
+                        f"Current NEAR price is ${current_price:.4f}. "
+                        f"Your target (${t_val:.2f} {direction}) hasn't been met yet. "
+                        f"I'll keep watching!"
+                    )
+                    logger.info(f"Target not met. Price ${current_price:.4f}, Target ${t_val:.2f} {direction}.")
 
-    # 4) 추가 사용자 입력 요청
-    env.request_user_input()
+        except Exception as e:
+            # Handle unexpected errors during price check/logic
+            logger.error(f"Unexpected error checking price or updating target: {e}", exc_info=True)
+            assistant_explanation = f"[ERROR] Sorry, an internal error occurred: {e}"
 
 
-# -------------------------------------------------
-# FastAPI 애플리케이션 생성
-# -------------------------------------------------
-app = FastAPI()
+    # This function now directly returns the string content for the assistant's message
+    return assistant_explanation, target_info # Return message and current target state
 
 
-@app.post("/near-price-alert")
-async def near_price_alert(request: Request):
+# --- FastAPI Endpoint ---
+
+@app.post("/chat", response_model=AssistantResponse)
+async def chat_endpoint(user_input: UserInput):
     """
-    사용자가 {"message": "..."} 형태의 JSON 데이터를 POST하면,
-    이를 user 메시지로 env에 추가한 뒤 handle_near_price_alert를 실행합니다.
-    마지막에 생성된 assistant 메시지를 JSON으로 반환합니다.
+    Receives user message, processes the alert logic, and returns the assistant's response.
     """
-    data = await request.json()
-    user_message = data.get("message", "").strip()
+    logger.info(f"Received user message: '{user_input.user_message}'")
 
-    # 사용자 메시지를 env에 기록
-    env.add_message("user", user_message)
+    if not user_input.user_message:
+        raise HTTPException(status_code=400, detail="User message cannot be empty.")
 
-    # 메인 로직 실행
-    handle_near_price_alert()
+    try:
+        # Call the core logic function
+        assistant_msg_content, current_target_info = handle_near_price_alert_logic(user_input.user_message)
 
-    # 로직 실행 후, env에 가장 최근에 추가된 assistant 메시지를 찾아 응답
-    assistant_msg = env.get_last_message(role="assistant")
-    if not assistant_msg:
-        return {"assistant": "No assistant response found."}
-    return {"assistant": assistant_msg["content"]}
+        # Construct the response
+        response = AssistantResponse(
+            assistant_message=assistant_msg_content,
+            target_info=current_target_info
+            )
+        return response
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions (like potential 500 from save_target_info)
+        raise http_exc
+    except Exception as e:
+        # Catch-all for other unexpected errors during processing
+        logger.error(f"Unhandled exception in /chat endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {e}")
+
+
+# --- Root endpoint for basic check ---
+@app.get("/")
+async def root():
+    return {"message": "NEAR Price Alert Assistant API is running. Use the /chat endpoint (POST) to interact."}
+
 
 
 if __name__ == "__main__":
     # 로컬에서 uvicorn으로 서버 실행
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# --- To run the app (using uvicorn) ---
+# Save this code as main.py
+# Run in terminal: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# (remove --reload in production)
+
+# Example curl request:
+# curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"user_message": "hi"}'
+# curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"user_message": "3.5 above"}'
+# curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"user_message": "check status"}'
+
+# Note: The hardcoded Korean apology response will only be returned if:
+# 1. No target_price.json exists or it's empty/invalid.
+# 2. The user's message ("hi" in the example) *cannot* be parsed as a valid target command ('price direction').

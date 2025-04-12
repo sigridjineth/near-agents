@@ -5,7 +5,12 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "certifi>=2025.1.31",
+    "fastapi>=0.111.1",
     "nearai>=0.1.16",
     "nearai-langchain>=0.0.12",
     "pip-system-certs>=4.0",
+    "pydantic>=2.10.6",
+    "python-multipart>=0.0.20",
+    "requests>=2.32.3",
+    "uvicorn>=0.32.1",
 ]

@@ -205,7 +205,7 @@ def handle_near_price_alert():
             final_answer = generate_llm_response(messages, assistant_explanation)
             env.add_message("assistant", final_answer)
             env.request_user_input()
-            return
+            return final_answer
         except Exception as e:
             err_msg = f"[ERROR] Unexpected error setting target: {e}"
             log_message(err_msg, logging.ERROR)
@@ -213,7 +213,7 @@ def handle_near_price_alert():
             final_answer = generate_llm_response(messages, assistant_explanation)
             env.add_message("assistant", final_answer)
             env.request_user_input()
-            return
+            return final_answer
 
     else:
         # 2) 이미 목표가 설정되어 있다면 -> 현재 가격 체크
@@ -249,6 +249,8 @@ def handle_near_price_alert():
 
     # 4) 추가 사용자 입력 요청
     env.request_user_input()
+
+    return final_answer
 
 
 # --- 4. 실행부 (예: LOCAL 모드에서 실행 시) ---
